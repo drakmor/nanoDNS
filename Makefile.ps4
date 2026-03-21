@@ -1,0 +1,27 @@
+PS4_HOST ?= ps4
+PS4_PORT ?= 9021
+
+ifdef PS4_PAYLOAD_SDK
+    include $(PS4_PAYLOAD_SDK)/toolchain/orbis.mk
+else
+    $(error PS4_PAYLOAD_SDK is undefined)
+endif
+
+ELF := nanodns-ps4.elf
+ELF_STRIP := $(firstword $(wildcard $(PS4_PAYLOAD_SDK)/bin/orbis-llvm-strip) \
+	$(wildcard $(PS4_PAYLOAD_SDK)/bin/orbis-strip))
+
+CFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -DPLATFORM_PS4=1
+LDLIBS := -lSceNet
+
+all: $(ELF)
+
+$(ELF): main.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(ELF_STRIP) --strip-all $@
+
+clean:
+	rm -f $(ELF)
+
+test: $(ELF)
+	$(PS4_DEPLOY) -h $(PS4_HOST) -p $(PS4_PORT) $^

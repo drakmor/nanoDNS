@@ -3,8 +3,12 @@
 [general]
 log=/data/nanodns/nanodns.log
 debug=0
+# use 0.0.0.0 to listen on all local IPv4 interfaces
+bind=127.0.0.1
 
 [upstream]
+# servers are tried in order
+# timeout_ms is the total budget for one query
 server=1.1.1.1
 server=8.8.8.8
 server=77.77.88.88

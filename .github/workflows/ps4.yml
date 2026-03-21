@@ -1,0 +1,64 @@
+name: PS4
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ps4-payload-dev/sdk
+          path: sdk
+
+      - name: Setup SDK
+        working-directory: sdk
+        run: |
+          sudo apt update
+          sudo apt install -y clang-18 lld-18
+          make DESTDIR=${{ runner.tool_cache }}/ps4-payload-sdk clean install
+          echo PS4_PAYLOAD_SDK=${{ runner.tool_cache }}/ps4-payload-sdk >> $GITHUB_ENV
+
+      - name: Checkout Payload
+        uses: actions/checkout@v4
+
+      - name: Build Payload
+        run: |
+          make -f Makefile.ps4 clean all
+
+      - name: Upload Payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Payload
+          path: nanodns-ps4.elf
+          if-no-files-found: error
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Payload
+          path: .
+
+      - name: Create GitHub Release (pre-release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: true
+          files: nanodns-ps4.elf

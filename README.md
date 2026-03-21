@@ -1,14 +1,18 @@
-# nanoDNS for PS5
+# nanoDNS for PS4/PS5
 
-Minimal PS5 payload DNS proxy that:
+Minimal PS4/PS5 payload DNS proxy that:
 
-- listens on all local IPv4 addresses on port `53`
+- listens on a configurable local IPv4 address on port `53`
 - applies local IPv4 overrides for domains matching shell-style masks
 - forwards all other DNS queries to upstream resolvers from `/data/nanodns/nanodns.ini`
 - stores runtime files under `/data/nanodns`
 - writes DNS queries and responses to a log file
 - can additionally mirror logs to `stdout`/`klog` when `debug=1`
 - supports an exceptions block to bypass local overrides for selected domains
+- can bind the listening socket to a specific local IPv4 address
+
+Upstream resolvers are tried in the order listed in the config. The payload
+stops on the first valid response within the configured timeout budget.
 
 ## Build
 
@@ -17,10 +21,23 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 make
 ```
 
+PS4 build:
+
+```sh
+export PS4_PAYLOAD_SDK=/opt/ps4-payload-sdk
+make -f Makefile.ps4
+```
+
 ## Deploy
 
 ```sh
 make test PS5_HOST=<ps5-ip-or-hostname>
+```
+
+PS4 deploy:
+
+```sh
+make -f Makefile.ps4 test PS4_HOST=<ps4-ip-or-hostname>
 ```
 
 ## Config
@@ -33,6 +50,7 @@ If the file does not exist, it creates one with defaults:
 [general]
 log=/data/nanodns/nanodns.log
 debug=0
+bind=127.0.0.1
 
 [upstream]
 server=1.1.1.1
@@ -63,14 +81,22 @@ gst.prod.dl.playstation.net
 # *.allowed.playstation.net
 ```
 
-Override masks use shell-style matching via `fnmatch(3)`, for example:
+Override masks use shell-style wildcard matching with `*`, `?`, bracket classes
+like `[abc]`, ranges like `[a-z]`, and negated classes like `[!0-9]`, for example:
 
 - `*.example.com`
 - `api??.test.local`
 - `exact.host.local`
 
 `debug=0` disables mirrored output to console and `klog`, but the file specified by
-`log=` still receives all requests and responses.
+`log=` still receives all requests and responses. The log file is overwritten on
+each startup.
+
+`bind=` sets the local IPv4 address used by the listening socket. The default is `127.0.0.1`.
+Use `bind=0.0.0.0` to listen on all local IPv4 interfaces.
+
+Entries in `[upstream]` are attempted in order. `timeout_ms` is the total time budget
+for trying the configured upstream servers for a single query.
 
 Entries in `[exceptions]` are also shell-style masks, one per line. If a query
 matches an exception, it is forwarded to upstream DNS and bypasses all local

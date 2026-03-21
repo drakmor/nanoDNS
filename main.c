@@ -1,7 +1,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fnmatch.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -19,25 +19,38 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#if defined(PLATFORM_PS4)
+#include <ps4/kernel.h>
+#include <ps4/klog.h>
+#define PAYLOAD_EXEC_NAME "nanodns-ps4.elf"
+#elif defined(PLATFORM_PS5)
 #include <ps5/kernel.h>
 #include <ps5/klog.h>
+#define PAYLOAD_EXEC_NAME "nanodns.elf"
+#else
+#error "Define PLATFORM_PS4 or PLATFORM_PS5"
+#endif
 
-#define APP_NAME "ps5-NanoDNS"
-#define APP_VERSION "0.1"
-#define APP_COPYRIGHT "(c) drakmor"
+#define APP_NAME "NanoDNS"
+#define APP_VERSION "0.2"
+#define APP_COPYRIGHT "(c) Drakmor"
 #define DATA_DIR "/data/nanodns"
 #define CONFIG_PATH DATA_DIR "/nanodns.ini"
 #define DEFAULT_LOG_PATH DATA_DIR "/nanodns.log"
 #define DNS_PORT 53
 #define MAX_DNS_PACKET 4096
 #define MAX_UPSTREAMS 8
-#define MAX_RULES 64
-#define MAX_EXCEPTIONS 64
+#define MAX_RULES 128
+#define MAX_EXCEPTIONS 128
+#define MAX_CONFIG_WARNINGS 128
+#define MAX_CONFIG_WARNING_LEN 256
 #define MAX_DOMAIN_LEN 256
 #define MAX_LOG_PATH 256
 #define DEFAULT_TIMEOUT_MS 1500
 #define OVERRIDE_TTL 60
 #define PRIVILEGED_AUTHID 0x4801000000000013L
+#define KI_PID_OFFSET 72
+#define KI_TDNAME_OFFSET 447
 
 int sceNetInit(void);
 int sceNetPoolCreate(const char *name, int size, int flags);
@@ -66,6 +79,10 @@ typedef struct {
 } exception_rule_t;
 
 typedef struct {
+  char text[MAX_CONFIG_WARNING_LEN];
+} config_warning_t;
+
+typedef struct {
   upstream_t upstreams[MAX_UPSTREAMS];
   size_t upstream_count;
   override_rule_t rules[MAX_RULES];
@@ -74,7 +91,11 @@ typedef struct {
   size_t exception_count;
   int timeout_ms;
   int debug_enabled;
+  struct in_addr bind_addr;
+  char bind_text[INET_ADDRSTRLEN];
   char log_path[MAX_LOG_PATH];
+  config_warning_t warnings[MAX_CONFIG_WARNINGS];
+  size_t warning_count;
 } app_config_t;
 
 typedef struct {
@@ -102,14 +123,17 @@ static const char *k_default_config =
     "# [general]\n"
     "# log=<path>\n"
     "# debug=0|1\n"
+    "# bind=<IPv4>\n"
+    "# Use 0.0.0.0 to listen on all IPv4 interfaces\n"
     "#\n"
     "# [upstream]\n"
     "# server=<IPv4>\n"
-    "# timeout_ms=<integer>\n"
+    "# Servers are tried in order until one replies\n"
+    "# timeout_ms=<integer-total-budget>\n"
     "#\n"
     "# [overrides]\n"
     "# <dns-mask>=<IPv4>\n"
-    "# Supports shell-style masks: *.example.com, api??.test.local\n"
+    "# Supports shell-style masks: *.example.com, api??.test.local, [ab]*.lab\n"
     "#\n"
     "# [exceptions]\n"
     "# One hostname or mask per line; these bypass local overrides\n"
@@ -117,6 +141,7 @@ static const char *k_default_config =
     "[general]\n"
     "log=" DEFAULT_LOG_PATH "\n"
     "debug=0\n"
+    "bind=127.0.0.1\n"
     "\n"
     "[upstream]\n"
     "server=1.1.1.1\n"
@@ -156,7 +181,7 @@ log_emit_direct(const char *buf, int to_debug) {
   if(to_debug) {
     fputs(buf, stdout);
     fflush(stdout);
-    klog_puts(buf);
+    klog_printf("%s", buf);
   }
 }
 
@@ -170,7 +195,7 @@ logger_init(const app_config_t *cfg) {
   }
 
   g_debug_enabled = cfg->debug_enabled ? 1 : 0;
-  g_log_file = fopen(cfg->log_path, "a");
+  g_log_file = fopen(cfg->log_path, "w");
   if(g_log_file == NULL) {
     if(!g_debug_enabled) {
       g_debug_enabled = 1;
@@ -355,11 +380,53 @@ normalize_domain(const char *input, char *output, size_t output_size) {
   output[out] = '\0';
 }
 
+static int
+parse_int_strict(const char *text, int *value) {
+  char *end = NULL;
+  long parsed;
+
+  errno = 0;
+  parsed = strtol(text, &end, 10);
+  if(errno != 0 || end == text || *end != '\0' || parsed < INT_MIN ||
+     parsed > INT_MAX) {
+    return -1;
+  }
+
+  *value = (int)parsed;
+  return 0;
+}
+
+static void
+config_add_warning(app_config_t *cfg, const char *fmt, ...) {
+  va_list ap;
+
+  if(cfg->warning_count >= MAX_CONFIG_WARNINGS) {
+    return;
+  }
+
+  va_start(ap, fmt);
+  vsnprintf(cfg->warnings[cfg->warning_count].text, MAX_CONFIG_WARNING_LEN, fmt,
+            ap);
+  va_end(ap);
+  ++cfg->warning_count;
+}
+
+static int
+config_set_bind_address(app_config_t *cfg, const char *ip) {
+  if(inet_pton(AF_INET, ip, &cfg->bind_addr) != 1) {
+    return -1;
+  }
+
+  snprintf(cfg->bind_text, sizeof(cfg->bind_text), "%s", ip);
+  return 0;
+}
+
 static void
 config_set_defaults(app_config_t *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->timeout_ms = DEFAULT_TIMEOUT_MS;
   cfg->debug_enabled = 0;
+  (void)config_set_bind_address(cfg, "127.0.0.1");
   snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", DEFAULT_LOG_PATH);
 }
 
@@ -391,7 +458,7 @@ config_add_rule(app_config_t *cfg, const char *mask, const char *ip) {
 
   rule = &cfg->rules[cfg->rule_count];
   if(inet_pton(AF_INET, ip, &rule->addr) != 1) {
-    return -1;
+    return -2;
   }
 
   snprintf(rule->mask, sizeof(rule->mask), "%s", mask);
@@ -490,8 +557,8 @@ find_pid(const char *name) {
 
   for(uint8_t *ptr = buf; ptr < (buf + buf_size);) {
     int ki_structsize = *(int *)ptr;
-    pid_t ki_pid = *(pid_t *)&ptr[72];
-    char *ki_tdname = (char *)&ptr[447];
+    pid_t ki_pid = *(pid_t *)&ptr[KI_PID_OFFSET];
+    char *ki_tdname = (char *)&ptr[KI_TDNAME_OFFSET];
 
     ptr += ki_structsize;
     if(!strcmp(name, ki_tdname) && ki_pid != mypid) {
@@ -579,6 +646,7 @@ load_config(const char *path, app_config_t *cfg) {
   } section = SECTION_NONE;
   FILE *fp;
   char line[512];
+  size_t line_no = 0;
   bool replace_upstreams = false;
 
   config_set_defaults(cfg);
@@ -597,6 +665,9 @@ load_config(const char *path, app_config_t *cfg) {
     char *eq;
     char *key;
     char *value;
+    struct in_addr addr;
+
+    ++line_no;
 
     s = trim(line);
 
@@ -641,7 +712,13 @@ load_config(const char *path, app_config_t *cfg) {
 
       key = trim(s);
       if(*key != '\0') {
+        size_t before = cfg->exception_count;
         config_add_exception(cfg, key);
+        if(cfg->exception_count == before) {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu too many exception rules, ignoring '%s'\n",
+                             path, line_no, key);
+        }
       }
       continue;
     }
@@ -661,11 +738,27 @@ load_config(const char *path, app_config_t *cfg) {
 
     if(section == SECTION_GENERAL ||
        (section == SECTION_NONE &&
-        (!strcasecmp(key, "log") || !strcasecmp(key, "debug")))) {
+        (!strcasecmp(key, "log") || !strcasecmp(key, "debug") ||
+         !strcasecmp(key, "bind")))) {
       if(!strcasecmp(key, "log")) {
         snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", value);
       } else if(!strcasecmp(key, "debug")) {
-        cfg->debug_enabled = atoi(value) != 0 ? 1 : 0;
+        int parsed_debug;
+
+        if(parse_int_strict(value, &parsed_debug) == 0) {
+          cfg->debug_enabled = parsed_debug != 0 ? 1 : 0;
+        } else {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid debug value '%s', keeping %s\n",
+                             path, line_no, value,
+                             cfg->debug_enabled ? "enabled" : "disabled");
+        }
+      } else if(!strcasecmp(key, "bind")) {
+        if(config_set_bind_address(cfg, value) != 0) {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid bind address '%s', keeping %s\n",
+                             path, line_no, value, cfg->bind_text);
+        }
       }
     } else if(section == SECTION_UPSTREAM) {
       if(!strcasecmp(key, "server") || !strcasecmp(key, "dns")) {
@@ -673,15 +766,40 @@ load_config(const char *path, app_config_t *cfg) {
           cfg->upstream_count = 0;
           replace_upstreams = true;
         }
-        (void)config_add_upstream(cfg, value);
+
+        if(inet_pton(AF_INET, value, &addr) != 1) {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid upstream server '%s', ignoring\n",
+                             path, line_no, value);
+        } else if(config_add_upstream(cfg, value) != 0) {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu too many upstream servers, ignoring '%s'\n",
+                             path, line_no, value);
+        }
       } else if(!strcasecmp(key, "timeout_ms")) {
-        cfg->timeout_ms = atoi(value);
-        if(cfg->timeout_ms <= 0) {
+        int parsed_timeout;
+
+        if(parse_int_strict(value, &parsed_timeout) == 0 &&
+            parsed_timeout > 0) {
+          cfg->timeout_ms = parsed_timeout;
+        } else {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid timeout_ms '%s', using %d\n",
+                             path, line_no, value, DEFAULT_TIMEOUT_MS);
           cfg->timeout_ms = DEFAULT_TIMEOUT_MS;
         }
       }
     } else if(section == SECTION_OVERRIDES) {
-      (void)config_add_rule(cfg, key, value);
+      int rc = config_add_rule(cfg, key, value);
+      if(rc == -2) {
+        config_add_warning(cfg,
+                           "[nanodns] warning: %s:%zu invalid override IPv4 '%s' for mask '%s', ignoring\n",
+                           path, line_no, value, key);
+      } else if(rc != 0) {
+        config_add_warning(cfg,
+                           "[nanodns] warning: %s:%zu too many override rules, ignoring '%s=%s'\n",
+                           path, line_no, key, value);
+      }
     }
   }
 
@@ -704,13 +822,13 @@ print_banner(void) {
 }
 
 static int
-send_startup_notification(void) {
+send_startup_notification(const app_config_t *cfg) {
   notify_request_t req;
   int rc;
 
   memset(&req, 0, sizeof(req));
-  rc = snprintf(req.message, sizeof(req.message), "%s v%s %s\nListening on *:53", APP_NAME,
-                APP_VERSION, APP_COPYRIGHT);
+  rc = snprintf(req.message, sizeof(req.message), "%s v%s %s\nListening on %s:%d",
+                APP_NAME, APP_VERSION, APP_COPYRIGHT, cfg->bind_text, DNS_PORT);
   if(rc < 0 || (size_t)rc >= sizeof(req.message)) {
     log_printf("[nanodns] failed to build startup notification message\n");
     return -1;
@@ -729,6 +847,10 @@ static int
 elevate_privileges(void) {
   pid_t pid = getpid();
 
+#if defined(PLATFORM_PS4)
+  (void)pid;
+  return 0;
+#else
   if(kernel_set_ucred_authid(pid, PRIVILEGED_AUTHID) != 0) {
     log_printf("[nanodns] unable to change AuthID for pid %d\n", pid);
     return -1;
@@ -736,6 +858,7 @@ elevate_privileges(void) {
 
   log_printf("[nanodns] AuthID updated for pid %d\n", pid);
   return 0;
+#endif
 }
 
 static int64_t
@@ -859,10 +982,118 @@ dns_parse_question(const uint8_t *packet, size_t packet_len, dns_question_t *q) 
   return 0;
 }
 
+static int
+domain_mask_match(const char *mask, const char *domain) {
+  while(*mask != '\0') {
+    if(*mask == '*') {
+      do {
+        ++mask;
+      } while(*mask == '*');
+
+      if(*mask == '\0') {
+        return 1;
+      }
+
+      while(*domain != '\0') {
+        if(domain_mask_match(mask, domain)) {
+          return 1;
+        }
+        ++domain;
+      }
+
+      return 0;
+    }
+
+    if(*domain == '\0') {
+      return 0;
+    }
+
+    if(*mask == '?') {
+      ++mask;
+      ++domain;
+      continue;
+    }
+
+    if(*mask == '[') {
+      bool negate = false;
+      bool matched = false;
+      const char *p = mask + 1;
+
+      if(*p == '!' || *p == '^') {
+        negate = true;
+        ++p;
+      }
+
+      if(*p == ']') {
+        matched = *domain == ']';
+        ++p;
+      }
+
+      while(*p != '\0' && *p != ']') {
+        unsigned char start;
+        unsigned char end;
+
+        if(*p == '\\' && p[1] != '\0') {
+          start = (unsigned char)p[1];
+          p += 2;
+        } else {
+          start = (unsigned char)*p++;
+        }
+
+        end = start;
+        if(*p == '-' && p[1] != '\0' && p[1] != ']') {
+          ++p;
+          if(*p == '\\' && p[1] != '\0') {
+            end = (unsigned char)p[1];
+            p += 2;
+          } else {
+            end = (unsigned char)*p++;
+          }
+        }
+
+        if((unsigned char)*domain >= start && (unsigned char)*domain <= end) {
+          matched = true;
+        }
+      }
+
+      if(*p != ']') {
+        if(*mask != *domain) {
+          return 0;
+        }
+
+        ++mask;
+        ++domain;
+        continue;
+      }
+
+      if(negate ? matched : !matched) {
+        return 0;
+      }
+
+      mask = p + 1;
+      ++domain;
+      continue;
+    }
+
+    if(*mask == '\\' && mask[1] != '\0') {
+      ++mask;
+    }
+
+    if(*mask != *domain) {
+      return 0;
+    }
+
+    ++mask;
+    ++domain;
+  }
+
+  return *domain == '\0';
+}
+
 static const override_rule_t *
 find_matching_rule(const app_config_t *cfg, const char *domain) {
   for(size_t i = 0; i < cfg->rule_count; ++i) {
-    if(fnmatch(cfg->rules[i].mask, domain, FNM_CASEFOLD) == 0) {
+    if(domain_mask_match(cfg->rules[i].mask, domain)) {
       return &cfg->rules[i];
     }
   }
@@ -873,7 +1104,7 @@ find_matching_rule(const app_config_t *cfg, const char *domain) {
 static int
 has_matching_exception(const app_config_t *cfg, const char *domain) {
   for(size_t i = 0; i < cfg->exception_count; ++i) {
-    if(fnmatch(cfg->exceptions[i].mask, domain, FNM_CASEFOLD) == 0) {
+    if(domain_mask_match(cfg->exceptions[i].mask, domain)) {
       return 1;
     }
   }
@@ -1057,132 +1288,237 @@ log_dns_response(const uint8_t *packet, size_t packet_len, const char *via) {
 }
 
 static int
-forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
-                          size_t request_len, uint16_t request_id,
-                          uint8_t *response, size_t response_cap,
-                          size_t *response_len, char *via, size_t via_len) {
-  struct {
-    int fd;
-    const upstream_t *upstream;
-  } active[MAX_UPSTREAMS];
-  struct pollfd pfds[MAX_UPSTREAMS];
-  size_t active_count = 0;
-  int64_t deadline_ms;
+open_upstream_socket(const upstream_t *upstream) {
+  struct sockaddr_in upstream_addr;
+  int fd;
 
-  for(size_t i = 0; i < cfg->upstream_count; ++i) {
-    struct sockaddr_in upstream_addr;
-    int fd;
+  memset(&upstream_addr, 0, sizeof(upstream_addr));
+  upstream_addr.sin_family = AF_INET;
+  upstream_addr.sin_port = htons(DNS_PORT);
+  upstream_addr.sin_addr = upstream->addr;
 
-    memset(&upstream_addr, 0, sizeof(upstream_addr));
-    upstream_addr.sin_family = AF_INET;
-    upstream_addr.sin_port = htons(DNS_PORT);
-    upstream_addr.sin_addr = cfg->upstreams[i].addr;
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if(fd < 0) {
-      log_printf("[nanodns] upstream %s socket failed: %s\n",
-                 cfg->upstreams[i].text, strerror(errno));
-      continue;
-    }
-
-    if(connect(fd, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) !=
-       0) {
-      close(fd);
-      log_printf("[nanodns] upstream %s connect failed: %s\n",
-                 cfg->upstreams[i].text, strerror(errno));
-      continue;
-    }
-
-    if(send(fd, request, request_len, 0) < 0) {
-      close(fd);
-      log_printf("[nanodns] upstream %s send failed: %s\n",
-                 cfg->upstreams[i].text, strerror(errno));
-      continue;
-    }
-
-    active[active_count].fd = fd;
-    active[active_count].upstream = &cfg->upstreams[i];
-    pfds[active_count].fd = fd;
-    pfds[active_count].events = POLLIN;
-    pfds[active_count].revents = 0;
-    ++active_count;
-  }
-
-  if(active_count == 0) {
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if(fd < 0) {
+    log_printf("[nanodns] upstream %s socket failed: %s\n", upstream->text,
+               strerror(errno));
     return -1;
   }
 
+  if(connect(fd, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) !=
+     0) {
+    log_printf("[nanodns] upstream %s connect failed: %s\n", upstream->text,
+               strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+static void
+close_upstream_socket(int *fd) {
+  if(*fd >= 0) {
+    close(*fd);
+    *fd = -1;
+  }
+}
+
+static void
+close_upstream_sockets(int *fds, size_t count) {
+  for(size_t i = 0; i < count; ++i) {
+    close_upstream_socket(&fds[i]);
+  }
+}
+
+static void
+invalidate_server_socket(int *server_fd, struct pollfd *pfd) {
+  if(*server_fd >= 0) {
+    close(*server_fd);
+    *server_fd = -1;
+  }
+
+  pfd->fd = -1;
+  pfd->events = POLLIN;
+  pfd->revents = 0;
+}
+
+static int
+open_server_socket(const app_config_t *cfg) {
+  struct sockaddr_in listen_addr;
+  int fd;
+  int reuse = 1;
+
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if(fd < 0) {
+    log_errno("socket(server)");
+    return -1;
+  }
+
+  if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+    log_errno("setsockopt(SO_REUSEADDR)");
+  }
+
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = htons(DNS_PORT);
+  listen_addr.sin_addr = cfg->bind_addr;
+
+  if(bind(fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) != 0) {
+    log_printf("[nanodns] bind(%s:%d) failed: %s\n", cfg->bind_text, DNS_PORT,
+               strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+static int
+drain_upstream_socket(int fd) {
+  uint8_t discard[MAX_DNS_PACKET];
+  struct pollfd pfd;
+
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+
+  while(true) {
+    ssize_t nread;
+
+    pfd.revents = 0;
+    if(poll(&pfd, 1, 0) <= 0) {
+      return 0;
+    }
+
+    if((pfd.revents & POLLIN) == 0) {
+      return (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0 ? 0 : -1;
+    }
+
+    nread = recv(fd, discard, sizeof(discard), 0);
+    if(nread <= 0) {
+      return -1;
+    }
+  }
+}
+
+static int
+server_socket_needs_reopen(int err) {
+  switch(err) {
+  case EBADF:
+  case EINVAL:
+  case ENOTSOCK:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int
+forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
+                          size_t request_len, uint16_t request_id,
+                          int *upstream_fds,
+                          uint8_t *response, size_t response_cap,
+                          size_t *response_len, char *via, size_t via_len) {
+  int64_t deadline_ms;
+
   deadline_ms = now_ms() + cfg->timeout_ms;
 
-  while(active_count > 0) {
-    int64_t timeout_ms = deadline_ms - now_ms();
+  for(size_t i = 0; i < cfg->upstream_count; ++i) {
+    struct pollfd pfd;
+    int fd;
     int poll_rc;
-    size_t idx = 0;
 
-    if(timeout_ms < 0) {
-      timeout_ms = 0;
-    }
-
-    poll_rc = poll(pfds, active_count, (int)timeout_ms);
-    if(poll_rc == 0) {
-      break;
-    }
-
-    if(poll_rc < 0) {
-      if(errno == EINTR) {
+    fd = upstream_fds[i];
+    if(fd < 0) {
+      fd = open_upstream_socket(&cfg->upstreams[i]);
+      if(fd < 0) {
         continue;
       }
 
-      log_printf("[nanodns] upstream poll failed: %s\n", strerror(errno));
-      break;
+      upstream_fds[i] = fd;
     }
 
-    while(idx < active_count) {
-      bool remove_entry = false;
-
-      if((pfds[idx].revents & POLLIN) != 0) {
-        ssize_t nread = recv(active[idx].fd, response, response_cap, 0);
-        if(nread < 0) {
-          log_printf("[nanodns] upstream %s recv failed: %s\n",
-                     active[idx].upstream->text, strerror(errno));
-          remove_entry = true;
-        } else if((size_t)nread < 12) {
-          log_printf("[nanodns] upstream %s returned short packet (%zd bytes)\n",
-                     active[idx].upstream->text, nread);
-        } else if(read_u16(response) != request_id) {
-          log_printf("[nanodns] upstream %s returned mismatched id 0x%04x\n",
-                     active[idx].upstream->text, read_u16(response));
-        } else {
-          for(size_t j = 0; j < active_count; ++j) {
-            close(active[j].fd);
-          }
-
-          *response_len = (size_t)nread;
-          snprintf(via, via_len, "%s", active[idx].upstream->text);
-          return 0;
-        }
-      } else if((pfds[idx].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        log_printf("[nanodns] upstream %s poll events=0x%x\n",
-                   active[idx].upstream->text, pfds[idx].revents);
-        remove_entry = true;
+    if(drain_upstream_socket(fd) != 0) {
+      log_printf("[nanodns] upstream %s drain failed, reconnecting\n",
+                 cfg->upstreams[i].text);
+      close_upstream_socket(&upstream_fds[i]);
+      fd = open_upstream_socket(&cfg->upstreams[i]);
+      if(fd < 0) {
+        continue;
       }
 
-      if(remove_entry) {
-        close(active[idx].fd);
-        --active_count;
-        if(idx != active_count) {
-          active[idx] = active[active_count];
-          pfds[idx] = pfds[active_count];
+      upstream_fds[i] = fd;
+    }
+
+    if(send(fd, request, request_len, 0) < 0) {
+      log_printf("[nanodns] upstream %s send failed: %s\n",
+                 cfg->upstreams[i].text, strerror(errno));
+      close_upstream_socket(&upstream_fds[i]);
+      continue;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    while(true) {
+      int64_t timeout_ms = deadline_ms - now_ms();
+
+      if(timeout_ms <= 0) {
+        log_printf("[nanodns] upstream %s timed out\n", cfg->upstreams[i].text);
+        close_upstream_socket(&upstream_fds[i]);
+        break;
+      }
+
+      poll_rc = poll(&pfd, 1, (int)timeout_ms);
+      if(poll_rc == 0) {
+        log_printf("[nanodns] upstream %s timed out\n",
+                   cfg->upstreams[i].text);
+        close_upstream_socket(&upstream_fds[i]);
+        break;
+      }
+
+      if(poll_rc < 0) {
+        if(errno == EINTR) {
           continue;
         }
+
+        log_printf("[nanodns] upstream %s poll failed: %s\n",
+                   cfg->upstreams[i].text, strerror(errno));
+        close_upstream_socket(&upstream_fds[i]);
+        break;
       }
 
-      ++idx;
-    }
-  }
+      if((pfd.revents & POLLIN) != 0) {
+        ssize_t nread = recv(fd, response, response_cap, 0);
+        if(nread < 0) {
+          log_printf("[nanodns] upstream %s recv failed: %s\n",
+                     cfg->upstreams[i].text, strerror(errno));
+          close_upstream_socket(&upstream_fds[i]);
+          break;
+        } else if((size_t)nread < 12) {
+          log_printf("[nanodns] upstream %s returned short packet (%zd bytes)\n",
+                     cfg->upstreams[i].text, nread);
+          close_upstream_socket(&upstream_fds[i]);
+          break;
+        } else if(read_u16(response) != request_id) {
+          log_printf("[nanodns] upstream %s returned mismatched id 0x%04x\n",
+                     cfg->upstreams[i].text, read_u16(response));
+          close_upstream_socket(&upstream_fds[i]);
+          break;
+        } else {
+          *response_len = (size_t)nread;
+          snprintf(via, via_len, "%s", cfg->upstreams[i].text);
+          return 0;
+        }
+      } else if((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        log_printf("[nanodns] upstream %s poll events=0x%x\n",
+                   cfg->upstreams[i].text, pfd.revents);
+        close_upstream_socket(&upstream_fds[i]);
+        break;
+      }
 
-  for(size_t i = 0; i < active_count; ++i) {
-    close(active[i].fd);
+      pfd.revents = 0;
+    }
   }
 
   return -1;
@@ -1235,9 +1571,8 @@ on_signal(int signo) {
 int
 main(void) {
   app_config_t cfg;
+  int upstream_fds[MAX_UPSTREAMS];
   int server_fd = -1;
-  int reuse = 1;
-  struct sockaddr_in listen_addr;
   struct pollfd pfd;
   int config_state;
   int config_errno = 0;
@@ -1245,7 +1580,11 @@ main(void) {
   int data_dir_state;
   int data_dir_errno = 0;
 
-  (void)syscall(SYS_thr_set_name, -1, "nanodns.elf");
+  for(size_t i = 0; i < MAX_UPSTREAMS; ++i) {
+    upstream_fds[i] = -1;
+  }
+
+  (void)syscall(SYS_thr_set_name, -1, PAYLOAD_EXEC_NAME);
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -1271,7 +1610,10 @@ main(void) {
 
   (void)logger_init(&cfg);
   print_banner();
-  (void)send_startup_notification();
+
+  for(size_t i = 0; i < cfg.warning_count; ++i) {
+    log_printf("%s", cfg.warnings[i].text);
+  }
 
   if(data_dir_state == 1) {
     log_printf("[nanodns] created runtime directory %s\n", DATA_DIR);
@@ -1314,53 +1656,38 @@ main(void) {
     log_printf("[nanodns] exception[%zu] = %s\n", i, cfg.exceptions[i].mask);
   }
 
-  if(terminate_existing_instances("nanodns.elf") != 0) {
+  if(terminate_existing_instances(PAYLOAD_EXEC_NAME) != 0) {
+    close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     logger_fini();
     return EXIT_FAILURE;
   }
 
   if(elevate_privileges() != 0) {
+    close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     logger_fini();
     return EXIT_FAILURE;
   }
 
   if(net_init() != 0) {
+    close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     logger_fini();
     return 1;
   }
 
-  server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  server_fd = open_server_socket(&cfg);
   if(server_fd < 0) {
-    log_errno("socket(server)");
+    close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     net_fini();
     logger_fini();
     return 1;
   }
 
-  if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) !=
-     0) {
-    log_errno("setsockopt(SO_REUSEADDR)");
-  }
-
-  memset(&listen_addr, 0, sizeof(listen_addr));
-  listen_addr.sin_family = AF_INET;
-  listen_addr.sin_port = htons(DNS_PORT);
-  listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-  if(bind(server_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) !=
-     0) {
-    log_errno("bind(*:53)");
-    close(server_fd);
-    net_fini();
-    logger_fini();
-    return 1;
-  }
-
-  log_printf("[nanodns] listening on all IPv4 addresses:%d\n", DNS_PORT);
+  log_printf("[nanodns] listening on %s:%d\n", cfg.bind_text, DNS_PORT);
 
   pfd.fd = server_fd;
   pfd.events = POLLIN;
   pfd.revents = 0;
+  (void)send_startup_notification(&cfg);
 
   while(g_running) {
     uint8_t request[MAX_DNS_PACKET];
@@ -1369,19 +1696,67 @@ main(void) {
     socklen_t client_len = sizeof(client_addr);
     dns_question_t question;
     ssize_t received;
+    int poll_rc;
 
-    if(poll(&pfd, 1, 1000) <= 0) {
+    if(server_fd < 0) {
+      log_printf("[nanodns] attempting to restore listening socket on %s:%d\n",
+                 cfg.bind_text, DNS_PORT);
+      server_fd = open_server_socket(&cfg);
+      if(server_fd < 0) {
+        sleep(1);
+        continue;
+      }
+
+      pfd.fd = server_fd;
+      pfd.events = POLLIN;
+      pfd.revents = 0;
+      log_printf("[nanodns] listening socket restored on %s:%d\n",
+                 cfg.bind_text, DNS_PORT);
+    }
+
+    poll_rc = poll(&pfd, 1, 1000);
+    if(poll_rc == 0) {
+      continue;
+    }
+
+    if(poll_rc < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+
+      log_errno("poll(server)");
+      if(server_socket_needs_reopen(errno)) {
+        invalidate_server_socket(&server_fd, &pfd);
+      }
+      continue;
+    }
+
+    if((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      log_printf("[nanodns] listening socket poll events=0x%x, recreating\n",
+                 pfd.revents);
+      invalidate_server_socket(&server_fd, &pfd);
       continue;
     }
 
     if((pfd.revents & POLLIN) == 0) {
+      pfd.revents = 0;
       continue;
     }
 
     received = recvfrom(server_fd, request, sizeof(request), 0,
                         (struct sockaddr *)&client_addr, &client_len);
     if(received < 0) {
+      if(errno == EINTR || errno == EAGAIN) {
+        pfd.revents = 0;
+        continue;
+      }
+
       log_errno("recvfrom(client)");
+      if(server_socket_needs_reopen(errno)) {
+        invalidate_server_socket(&server_fd, &pfd);
+      } else {
+        pfd.revents = 0;
+      }
       continue;
     }
 
@@ -1455,7 +1830,8 @@ main(void) {
       char via[INET_ADDRSTRLEN];
 
       if(forward_query_to_upstream(&cfg, request, (size_t)received, question.id,
-                                   response, sizeof(response), &response_len,
+                                   upstream_fds, response, sizeof(response),
+                                   &response_len,
                                    via, sizeof(via)) == 0) {
         if(sendto(server_fd, response, response_len, 0,
                   (struct sockaddr *)&client_addr, client_len) < 0) {
@@ -1479,10 +1855,13 @@ main(void) {
         }
       }
     }
+
+    pfd.revents = 0;
   }
 
   log_printf("[nanodns] shutting down\n");
-  close(server_fd);
+  invalidate_server_socket(&server_fd, &pfd);
+  close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
   net_fini();
   logger_fini();
   return 0;
