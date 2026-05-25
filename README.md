@@ -1,5 +1,10 @@
 # nanoDNS for PS4/PS5
 
+**Repository:** https://github.com/drakmor/nanoDNS
+
+**Discord:** https://discord.gg/hVnfFMHK
+
+
 Minimal PS4/PS5 payload DNS proxy that:
 
 - listens on a configurable local IPv4 address on port `53`
