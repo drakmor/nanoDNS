@@ -2,8 +2,7 @@
 
 **Repository:** https://github.com/drakmor/nanoDNS
 
-**Discord:** https://discord.gg/hVnfFMHK
-
+**Discord:** https://discord.gg/x2Ppvzwjhm
 
 Minimal PS4/PS5 payload DNS proxy that:
 
