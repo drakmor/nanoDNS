@@ -32,7 +32,7 @@
 #endif
 
 #define APP_NAME "NanoDNS"
-#define APP_VERSION "0.2"
+#define APP_VERSION "0.3"
 #define APP_COPYRIGHT "(c) Drakmor"
 #define DATA_DIR "/data/nanodns"
 #define CONFIG_PATH DATA_DIR "/nanodns.ini"
@@ -533,6 +533,7 @@ config_apply_builtin_overrides(app_config_t *cfg) {
   return 0;
 }
 
+#if defined(PLATFORM_PS5)
 static int
 find_pid(const char *name) {
   int mib[4] = {1, 14, 8, 0};
@@ -587,6 +588,7 @@ terminate_existing_instances(const char *name) {
 
   return 0;
 }
+#endif
 
 static int
 ensure_runtime_dir_exists(const char *path) {
@@ -1584,7 +1586,9 @@ main(void) {
     upstream_fds[i] = -1;
   }
 
+#if defined(PLATFORM_PS5)
   (void)syscall(SYS_thr_set_name, -1, PAYLOAD_EXEC_NAME);
+#endif
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -1656,11 +1660,13 @@ main(void) {
     log_printf("[nanodns] exception[%zu] = %s\n", i, cfg.exceptions[i].mask);
   }
 
+#if defined(PLATFORM_PS5)
   if(terminate_existing_instances(PAYLOAD_EXEC_NAME) != 0) {
     close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     logger_fini();
     return EXIT_FAILURE;
   }
+#endif
 
   if(elevate_privileges() != 0) {
     close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
