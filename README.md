@@ -6,14 +6,14 @@
 
 Minimal PS4/PS5 payload DNS proxy that:
 
-- listens on a configurable local IPv4 address on port `53`
+- listens on configurable local IPv4 and IPv6 addresses on port `53`
 - applies local IPv4 overrides for domains matching shell-style masks
 - forwards all other DNS queries to upstream resolvers from `/data/nanodns/nanodns.ini`
 - stores runtime files under `/data/nanodns`
 - writes DNS queries and responses to a log file
 - can additionally mirror logs to `stdout`/`klog` when `debug=1`
 - supports an exceptions block to bypass local overrides for selected domains
-- can bind the listening socket to a specific local IPv4 address
+- can bind the listening sockets to specific local IPv4 and IPv6 addresses
 
 Upstream resolvers are tried in the order listed in the config. The payload
 stops on the first valid response within the configured timeout budget.
@@ -62,6 +62,7 @@ If the file does not exist, it creates one with defaults:
 log=/data/nanodns/nanodns.log
 debug=0
 bind=127.0.0.1
+bind6=::1
 
 [upstream]
 server=1.1.1.1
@@ -103,8 +104,12 @@ like `[abc]`, ranges like `[a-z]`, and negated classes like `[!0-9]`, for exampl
 `log=` still receives all requests and responses. The log file is overwritten on
 each startup.
 
-`bind=` sets the local IPv4 address used by the listening socket. The default is `127.0.0.1`.
+`bind=` sets the local IPv4 address used by the IPv4 listening socket. The default is `127.0.0.1`.
 Use `bind=0.0.0.0` to listen on all local IPv4 interfaces.
+
+`bind6=` sets the local IPv6 address used by the IPv6 listening socket. The default is `::1`.
+Use `bind6=::` to listen on all local IPv6 interfaces.
+Use `bind6=off` to disable the IPv6 listener entirely.
 
 Entries in `[upstream]` are attempted in order. `timeout_ms` is the total time budget
 for trying the configured upstream servers for a single query.

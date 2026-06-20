@@ -5,6 +5,9 @@ log=/data/nanodns/nanodns.log
 debug=0
 # use 0.0.0.0 to listen on all local IPv4 interfaces
 bind=127.0.0.1
+# use :: to listen on all local IPv6 interfaces
+# use off to disable the IPv6 listener
+bind6=::1
 
 [upstream]
 # servers are tried in order
