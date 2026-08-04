@@ -98,6 +98,7 @@ typedef struct {
   size_t exception_count;
   int timeout_ms;
   int debug_enabled;
+  int quiet_enabled;
   struct in_addr bind_addr;
   char bind_text[INET_ADDRSTRLEN];
   bool bind6_enabled;
@@ -141,6 +142,7 @@ static const char *k_default_config =
     "# [general]\n"
     "# log=<path>\n"
     "# debug=0|1\n"
+    "# quiet=0|1\n"
     "# bind=<IPv4>\n"
     "# bind6=<IPv6>|off\n"
     "# Use 0.0.0.0 to listen on all IPv4 interfaces\n"
@@ -162,6 +164,7 @@ static const char *k_default_config =
     "[general]\n"
     "log=" DEFAULT_LOG_PATH "\n"
     "debug=0\n"
+    "quiet=0\n"
     "bind=127.0.0.1\n"
     "bind6=::1\n"
     "\n"
@@ -473,6 +476,7 @@ config_set_defaults(app_config_t *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->timeout_ms = DEFAULT_TIMEOUT_MS;
   cfg->debug_enabled = 0;
+  cfg->quiet_enabled = 0;
   (void)config_set_bind_address(cfg, "127.0.0.1");
   (void)config_set_bind6_address(cfg, "::1");
   snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", DEFAULT_LOG_PATH);
@@ -789,7 +793,8 @@ load_config(const char *path, app_config_t *cfg) {
     if(section == SECTION_GENERAL ||
        (section == SECTION_NONE &&
         (!strcasecmp(key, "log") || !strcasecmp(key, "debug") ||
-         !strcasecmp(key, "bind") || !strcasecmp(key, "bind6")))) {
+         !strcasecmp(key, "quiet") || !strcasecmp(key, "bind") ||
+         !strcasecmp(key, "bind6")))) {
       if(!strcasecmp(key, "log")) {
         snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", value);
       } else if(!strcasecmp(key, "debug")) {
@@ -802,6 +807,17 @@ load_config(const char *path, app_config_t *cfg) {
                              "[nanodns] warning: %s:%zu invalid debug value '%s', keeping %s\n",
                              path, line_no, value,
                              cfg->debug_enabled ? "enabled" : "disabled");
+        }
+      } else if(!strcasecmp(key, "quiet")) {
+        int parsed_quiet;
+
+        if(parse_int_strict(value, &parsed_quiet) == 0) {
+          cfg->quiet_enabled = parsed_quiet != 0 ? 1 : 0;
+        } else {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid quiet value '%s', keeping %s\n",
+                             path, line_no, value,
+                             cfg->quiet_enabled ? "enabled" : "disabled");
         }
       } else if(!strcasecmp(key, "bind")) {
         if(config_set_bind_address(cfg, value) != 0) {
@@ -1965,6 +1981,8 @@ main(void) {
   }
   log_printf("[nanodns] debug output: %s\n",
              cfg.debug_enabled ? "enabled" : "disabled");
+  log_printf("[nanodns] quiet mode: %s\n",
+             cfg.quiet_enabled ? "enabled" : "disabled");
   log_printf("[nanodns] bind IPv4: %s:%d\n", cfg.bind_text, DNS_PORT);
   if(cfg.bind6_enabled) {
     log_printf("[nanodns] bind IPv6: [%s]:%d\n", cfg.bind6_text, DNS_PORT);
@@ -2031,9 +2049,11 @@ main(void) {
     log_printf("[nanodns] continuing without IPv6 listener\n");
   }
 
-  (void)send_startup_notification(
-      &cfg, listeners[SERVER_LISTENER_IPV4].fd >= 0,
-      listeners[SERVER_LISTENER_IPV6].fd >= 0);
+  if(!cfg.quiet_enabled) {
+    (void)send_startup_notification(
+        &cfg, listeners[SERVER_LISTENER_IPV4].fd >= 0,
+        listeners[SERVER_LISTENER_IPV6].fd >= 0);
+  }
 
   while(g_running) {
     nfds_t poll_count = 0;

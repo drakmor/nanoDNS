@@ -61,6 +61,7 @@ If the file does not exist, it creates one with defaults:
 [general]
 log=/data/nanodns/nanodns.log
 debug=0
+quiet=0
 bind=127.0.0.1
 bind6=::1
 
@@ -103,6 +104,9 @@ like `[abc]`, ranges like `[a-z]`, and negated classes like `[!0-9]`, for exampl
 `debug=0` disables mirrored output to console and `klog`, but the file specified by
 `log=` still receives all requests and responses. The log file is overwritten on
 each startup.
+
+`quiet=1` disables popup notifications. The default is `quiet=0`, so startup
+notifications are shown.
 
 `bind=` sets the local IPv4 address used by the IPv4 listening socket. The default is `127.0.0.1`.
 Use `bind=0.0.0.0` to listen on all local IPv4 interfaces.

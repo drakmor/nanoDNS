@@ -3,6 +3,8 @@
 [general]
 log=/data/nanodns/nanodns.log
 debug=0
+# set to 1 to disable popup notifications
+quiet=0
 # use 0.0.0.0 to listen on all local IPv4 interfaces
 bind=127.0.0.1
 # use :: to listen on all local IPv6 interfaces
