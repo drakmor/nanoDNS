@@ -67,7 +67,7 @@ bind6=::1
 [upstream]
 server=1.1.1.1
 server=8.8.8.8
-server=77.77.88.88
+server=77.88.8.8
 timeout_ms=1500
 
 [overrides]
