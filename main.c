@@ -192,7 +192,6 @@ static const char *k_default_config =
     "stun.*.playstation.net\n"
     "ena.net.playstation.net\n"
     "post.net.playstation.net\n"
-    "gst.prod.dl.playstation.net\n"
     "# auth.api.playstation.net\n"
     "# *.allowed.playstation.net\n";
 
@@ -542,7 +541,6 @@ config_apply_builtin_exceptions(app_config_t *cfg) {
   config_add_exception(cfg, "stun.*.playstation.net");
   config_add_exception(cfg, "ena.net.playstation.net");
   config_add_exception(cfg, "post.net.playstation.net");
-  config_add_exception(cfg, "gst.prod.dl.playstation.net");
 }
 
 static void

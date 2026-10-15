@@ -89,10 +89,12 @@ feature.api.playstation.com
 stun.*.playstation.net
 ena.net.playstation.net
 post.net.playstation.net
-gst.prod.dl.playstation.net
 # auth.api.playstation.net
 # *.allowed.playstation.net
 ```
+
+An existing `/data/nanodns/nanodns.ini` is kept on upgrade, so if yours still
+lists `gst.prod.dl.playstation.net` under `[exceptions]`, remove that line by hand.
 
 Override masks use shell-style wildcard matching with `*`, `?`, bracket classes
 like `[abc]`, ranges like `[a-z]`, and negated classes like `[!0-9]`, for example:
