@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -12,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/sockio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
@@ -48,6 +51,7 @@
 #define MAX_LOG_PATH 256
 #define DEFAULT_TIMEOUT_MS 1500
 #define LISTENER_RETRY_MS 1000
+#define LOOPBACK_IFNAME "lo0"
 #define OVERRIDE_TTL 60
 #define PRIVILEGED_AUTHID 0x4801000000000013L
 #define KI_PID_OFFSET 72
@@ -104,6 +108,9 @@ typedef struct {
   bool bind6_enabled;
   struct in6_addr bind6_addr;
   char bind6_text[INET6_ADDRSTRLEN];
+  bool loopback_alias_enabled;
+  struct in_addr loopback_alias_addr;
+  char loopback_alias_text[INET_ADDRSTRLEN];
   char log_path[MAX_LOG_PATH];
   config_warning_t warnings[MAX_CONFIG_WARNINGS];
   size_t warning_count;
@@ -145,9 +152,12 @@ static const char *k_default_config =
     "# quiet=0|1\n"
     "# bind=<IPv4>\n"
     "# bind6=<IPv6>|off\n"
+    "# loopback_alias=<127.x.y.z>|off\n"
     "# Use 0.0.0.0 to listen on all IPv4 interfaces\n"
     "# Use :: to listen on all IPv6 interfaces\n"
     "# Use off to disable the IPv6 listener\n"
+    "# loopback_alias adds that address to lo0 while the payload runs,\n"
+    "# so the console's DNS setting can point at it (e.g. 127.0.0.2)\n"
     "#\n"
     "# [upstream]\n"
     "# server=<IPv4>\n"
@@ -464,6 +474,28 @@ config_disable_bind6_address(app_config_t *cfg) {
   snprintf(cfg->bind6_text, sizeof(cfg->bind6_text), "off");
 }
 
+static int
+config_set_loopback_alias(app_config_t *cfg, const char *ip) {
+  struct in_addr addr;
+
+  if(inet_pton(AF_INET, ip, &addr) != 1 || !IN_LOOPBACK(ntohl(addr.s_addr))) {
+    return -1;
+  }
+
+  cfg->loopback_alias_enabled = true;
+  cfg->loopback_alias_addr = addr;
+  snprintf(cfg->loopback_alias_text, sizeof(cfg->loopback_alias_text), "%s",
+           ip);
+  return 0;
+}
+
+static void
+config_disable_loopback_alias(app_config_t *cfg) {
+  cfg->loopback_alias_enabled = false;
+  memset(&cfg->loopback_alias_addr, 0, sizeof(cfg->loopback_alias_addr));
+  snprintf(cfg->loopback_alias_text, sizeof(cfg->loopback_alias_text), "off");
+}
+
 static bool
 config_value_is_disabled(const char *value) {
   return !strcasecmp(value, "off") || !strcasecmp(value, "disabled") ||
@@ -479,6 +511,7 @@ config_set_defaults(app_config_t *cfg) {
   cfg->quiet_enabled = 0;
   (void)config_set_bind_address(cfg, "127.0.0.1");
   (void)config_set_bind6_address(cfg, "::1");
+  config_disable_loopback_alias(cfg);
   snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", DEFAULT_LOG_PATH);
 }
 
@@ -794,7 +827,7 @@ load_config(const char *path, app_config_t *cfg) {
        (section == SECTION_NONE &&
         (!strcasecmp(key, "log") || !strcasecmp(key, "debug") ||
          !strcasecmp(key, "quiet") || !strcasecmp(key, "bind") ||
-         !strcasecmp(key, "bind6")))) {
+         !strcasecmp(key, "bind6") || !strcasecmp(key, "loopback_alias")))) {
       if(!strcasecmp(key, "log")) {
         snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", value);
       } else if(!strcasecmp(key, "debug")) {
@@ -832,6 +865,14 @@ load_config(const char *path, app_config_t *cfg) {
           config_add_warning(cfg,
                              "[nanodns] warning: %s:%zu invalid bind6 address '%s', keeping %s\n",
                              path, line_no, value, cfg->bind6_text);
+        }
+      } else if(!strcasecmp(key, "loopback_alias")) {
+        if(config_value_is_disabled(value)) {
+          config_disable_loopback_alias(cfg);
+        } else if(config_set_loopback_alias(cfg, value) != 0) {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid loopback_alias '%s' (must be in 127.0.0.0/8), keeping %s\n",
+                             path, line_no, value, cfg->loopback_alias_text);
         }
       }
     } else if(section == SECTION_UPSTREAM) {
@@ -1474,6 +1515,116 @@ log_server_listener_addr(const app_config_t *cfg, const server_listener_t *liste
 }
 
 static int
+probe_local_ipv4_address(struct in_addr addr) {
+  struct sockaddr_in probe;
+  int saved_errno;
+  int fd;
+
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if(fd < 0) {
+    return -1;
+  }
+
+  memset(&probe, 0, sizeof(probe));
+  probe.sin_family = AF_INET;
+  probe.sin_addr = addr;
+  if(bind(fd, (struct sockaddr *)&probe, sizeof(probe)) == 0) {
+    close(fd);
+    return 1;
+  }
+
+  saved_errno = errno;
+  close(fd);
+  errno = saved_errno;
+  return saved_errno == EADDRNOTAVAIL ? 0 : -1;
+}
+
+static int
+loopback_alias_add(const app_config_t *cfg, bool *added) {
+  struct ifaliasreq req;
+  struct sockaddr_in addr;
+  struct sockaddr_in mask;
+  int present;
+  int fd;
+
+  *added = false;
+  present = probe_local_ipv4_address(cfg->loopback_alias_addr);
+  if(present == 1) {
+    log_printf("[nanodns] loopback alias %s already present\n",
+               cfg->loopback_alias_text);
+    return 0;
+  }
+  if(present < 0) {
+    log_printf("[nanodns] warning: could not check loopback alias %s: %s\n",
+               cfg->loopback_alias_text, strerror(errno));
+    return -1;
+  }
+
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if(fd < 0) {
+    log_errno("socket(loopback-alias)");
+    return -1;
+  }
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_len = sizeof(addr);
+  addr.sin_family = AF_INET;
+  addr.sin_addr = cfg->loopback_alias_addr;
+  memset(&mask, 0, sizeof(mask));
+  mask.sin_len = sizeof(mask);
+  mask.sin_family = AF_INET;
+  mask.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+  memset(&req, 0, sizeof(req));
+  snprintf(req.ifra_name, sizeof(req.ifra_name), "%s", LOOPBACK_IFNAME);
+  memcpy(&req.ifra_addr, &addr, sizeof(addr));
+  memcpy(&req.ifra_mask, &mask, sizeof(mask));
+
+  if(ioctl(fd, SIOCAIFADDR, &req) != 0) {
+    log_printf("[nanodns] warning: could not add loopback alias %s to %s: %s\n",
+               cfg->loopback_alias_text, LOOPBACK_IFNAME, strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  close(fd);
+  *added = true;
+  log_printf("[nanodns] added loopback alias %s/32 to %s\n",
+             cfg->loopback_alias_text, LOOPBACK_IFNAME);
+  return 0;
+}
+
+static void
+loopback_alias_remove(const app_config_t *cfg) {
+  struct ifreq req;
+  struct sockaddr_in addr;
+  int fd;
+
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if(fd < 0) {
+    log_errno("socket(loopback-alias)");
+    return;
+  }
+
+  memset(&req, 0, sizeof(req));
+  snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", LOOPBACK_IFNAME);
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_len = sizeof(addr);
+  addr.sin_family = AF_INET;
+  addr.sin_addr = cfg->loopback_alias_addr;
+  memcpy(&req.ifr_addr, &addr, sizeof(addr));
+
+  if(ioctl(fd, SIOCDIFADDR, &req) != 0) {
+    log_printf("[nanodns] warning: could not remove loopback alias %s from %s: %s\n",
+               cfg->loopback_alias_text, LOOPBACK_IFNAME, strerror(errno));
+  } else {
+    log_printf("[nanodns] removed loopback alias %s from %s\n",
+               cfg->loopback_alias_text, LOOPBACK_IFNAME);
+  }
+  close(fd);
+}
+
+static int
 open_server_socket4(const app_config_t *cfg) {
   struct sockaddr_in listen_addr;
   int fd;
@@ -1914,6 +2065,7 @@ main(void) {
   int config_loaded = 0;
   int data_dir_state;
   int data_dir_errno = 0;
+  bool loopback_alias_added = false;
 
   for(size_t i = 0; i < MAX_UPSTREAMS; ++i) {
     upstream_fds[i] = -1;
@@ -1989,6 +2141,7 @@ main(void) {
   } else {
     log_printf("[nanodns] bind IPv6: disabled\n");
   }
+  log_printf("[nanodns] loopback alias: %s\n", cfg.loopback_alias_text);
   log_printf("[nanodns] config loaded: %zu upstream(s), %zu rule(s), %zu exception(s), timeout=%dms\n",
              cfg.upstream_count, cfg.rule_count, cfg.exception_count,
              cfg.timeout_ms);
@@ -2026,12 +2179,19 @@ main(void) {
     return 1;
   }
 
+  if(cfg.loopback_alias_enabled) {
+    (void)loopback_alias_add(&cfg, &loopback_alias_added);
+  }
+
   for(size_t i = 0; i < SERVER_LISTENER_COUNT; ++i) {
     (void)open_server_listener(&cfg, &listeners[i]);
   }
 
   if(listeners[SERVER_LISTENER_IPV4].fd < 0 &&
      listeners[SERVER_LISTENER_IPV6].fd < 0) {
+    if(loopback_alias_added) {
+      loopback_alias_remove(&cfg);
+    }
     close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
     net_fini();
     logger_fini();
@@ -2120,6 +2280,9 @@ main(void) {
     invalidate_server_listener(&listeners[i]);
   }
   close_upstream_sockets(upstream_fds, MAX_UPSTREAMS);
+  if(loopback_alias_added) {
+    loopback_alias_remove(&cfg);
+  }
   net_fini();
   logger_fini();
   return 0;

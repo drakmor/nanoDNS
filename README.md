@@ -14,6 +14,8 @@ Minimal PS4/PS5 payload DNS proxy that:
 - can additionally mirror logs to `stdout`/`klog` when `debug=1`
 - supports an exceptions block to bypass local overrides for selected domains
 - can bind the listening sockets to specific local IPv4 and IPv6 addresses
+- can add an extra loopback address (for example `127.0.0.2`) so the console's
+  DNS setting can point at it
 
 Upstream resolvers are tried in the order listed in the config. The payload
 stops on the first valid response within the configured timeout budget.
@@ -114,6 +116,15 @@ Use `bind=0.0.0.0` to listen on all local IPv4 interfaces.
 `bind6=` sets the local IPv6 address used by the IPv6 listening socket. The default is `::1`.
 Use `bind6=::` to listen on all local IPv6 interfaces.
 Use `bind6=off` to disable the IPv6 listener entirely.
+
+`loopback_alias=` adds one extra address from `127.0.0.0/8` (for example `127.0.0.2`)
+to `lo0` while the payload runs, so the console's DNS setting can point at it.
+Without it only `127.0.0.1` exists on `lo0`: `bind=127.0.0.2` fails with
+`EADDRNOTAVAIL`, and queries the console sends to `127.0.0.2` never reach a
+`bind=0.0.0.0` listener. The address is removed again on a clean exit, and an
+address that was already present is left alone. When an instance is killed
+instead, including when a new instance replaces it, the address stays on `lo0`
+until the console restarts. The default is `off`.
 
 Entries in `[upstream]` are attempted in order. `timeout_ms` is the total time budget
 for trying the configured upstream servers for a single query.

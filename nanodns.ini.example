@@ -10,6 +10,9 @@ bind=127.0.0.1
 # use :: to listen on all local IPv6 interfaces
 # use off to disable the IPv6 listener
 bind6=::1
+# add an extra 127.0.0.0/8 address to lo0 while the payload runs,
+# e.g. to use 127.0.0.2 as the console's DNS server; off by default
+# loopback_alias=127.0.0.2
 
 [upstream]
 # servers are tried in order
