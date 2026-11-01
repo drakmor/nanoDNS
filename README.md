@@ -118,6 +118,18 @@ Use `bind6=off` to disable the IPv6 listener entirely.
 Entries in `[upstream]` are attempted in order. `timeout_ms` is the total time budget
 for trying the configured upstream servers for a single query.
 
+`server=gateway` uses the network's default gateway, taken from the kernel's routing table
+for each query, so it follows the console from one network to another. Most routers answer
+DNS there, which makes it the DNS the network itself hands out: a router's own names and
+split-horizon records then work, and a network that blocks outside resolvers still answers.
+With no default gateway the entry is skipped. Put it first and public resolvers after it:
+
+```ini
+[upstream]
+server=gateway
+server=1.1.1.1
+```
+
 Entries in `[exceptions]` are also shell-style masks, one per line. If a query
 matches an exception, it is forwarded to upstream DNS and bypasses all local
 override rules.

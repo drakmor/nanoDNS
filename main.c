@@ -19,6 +19,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <net/if.h>
+#include <net/route.h>
+
 #if defined(PLATFORM_PS4)
 #include <ps4/kernel.h>
 #include <ps4/klog.h>
@@ -73,6 +76,7 @@ typedef struct notify_request {
 typedef struct {
   struct in_addr addr;
   char text[INET_ADDRSTRLEN];
+  bool gateway; /* server=gateway: addr is the default gateway, looked up per query */
 } upstream_t;
 
 typedef struct {
@@ -150,8 +154,9 @@ static const char *k_default_config =
     "# Use off to disable the IPv6 listener\n"
     "#\n"
     "# [upstream]\n"
-    "# server=<IPv4>\n"
+    "# server=<IPv4>|gateway\n"
     "# Servers are tried in order until one replies\n"
+    "# gateway is the network's default gateway, which usually runs its DNS\n"
     "# timeout_ms=<integer-total-budget>\n"
     "#\n"
     "# [overrides]\n"
@@ -501,6 +506,22 @@ config_add_upstream(app_config_t *cfg, const char *ip) {
 }
 
 static int
+config_add_gateway_upstream(app_config_t *cfg) {
+  upstream_t *upstream;
+
+  if(cfg->upstream_count >= MAX_UPSTREAMS) {
+    return -1;
+  }
+
+  upstream = &cfg->upstreams[cfg->upstream_count];
+  memset(upstream, 0, sizeof(*upstream));
+  upstream->gateway = true;
+  snprintf(upstream->text, sizeof(upstream->text), "gateway");
+  ++cfg->upstream_count;
+  return 0;
+}
+
+static int
 config_add_rule(app_config_t *cfg, const char *mask, const char *ip) {
   override_rule_t *rule;
 
@@ -841,7 +862,13 @@ load_config(const char *path, app_config_t *cfg) {
           replace_upstreams = true;
         }
 
-        if(inet_pton(AF_INET, value, &addr) != 1) {
+        if(!strcasecmp(value, "gateway")) {
+          if(config_add_gateway_upstream(cfg) != 0) {
+            config_add_warning(cfg,
+                               "[nanodns] warning: %s:%zu too many upstream servers, ignoring '%s'\n",
+                               path, line_no, value);
+          }
+        } else if(inet_pton(AF_INET, value, &addr) != 1) {
           config_add_warning(cfg,
                              "[nanodns] warning: %s:%zu invalid upstream server '%s', ignoring\n",
                              path, line_no, value);
@@ -1429,6 +1456,88 @@ open_upstream_socket(const upstream_t *upstream) {
   return fd;
 }
 
+/* The IPv4 default gateway from the kernel's routing table, or -1 when there is none. */
+static int
+find_default_gateway(struct in_addr *gateway) {
+  int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0};
+  size_t len = 0;
+  char *buf;
+  int found = -1;
+
+  if(sysctl(mib, 6, NULL, &len, NULL, 0) != 0 || len == 0) {
+    return -1;
+  }
+  len += len / 2; /* the table may grow between the two calls */
+  buf = malloc(len);
+  if(buf == NULL) {
+    return -1;
+  }
+  if(sysctl(mib, 6, buf, &len, NULL, 0) != 0) {
+    free(buf);
+    return -1;
+  }
+
+  for(char *next = buf; next + sizeof(struct rt_msghdr) <= buf + len;) {
+    const struct rt_msghdr *rtm = (const struct rt_msghdr *)next;
+    const struct sockaddr *dst = (const struct sockaddr *)(rtm + 1);
+    const struct sockaddr *gw;
+
+    if(rtm->rtm_msglen == 0) {
+      break;
+    }
+    next += rtm->rtm_msglen;
+    if(!(rtm->rtm_flags & RTF_GATEWAY) || !(rtm->rtm_flags & RTF_UP) ||
+       (rtm->rtm_addrs & (RTA_DST | RTA_GATEWAY)) != (RTA_DST | RTA_GATEWAY) ||
+       dst->sa_family != AF_INET) {
+      continue;
+    }
+    gw = (const struct sockaddr *)((const char *)dst + SA_SIZE(dst));
+    if(gw->sa_family != AF_INET ||
+       ((const struct sockaddr_in *)dst)->sin_addr.s_addr != INADDR_ANY) {
+      continue;
+    }
+    *gateway = ((const struct sockaddr_in *)gw)->sin_addr;
+    found = 0;
+    break;
+  }
+
+  free(buf);
+  return found;
+}
+
+/* The address to query for an upstream: fixed, or for server=gateway the default gateway at
+ * this moment (it changes with the network). -1 when a gateway upstream has none. */
+static int
+upstream_current_addr(const upstream_t *upstream, struct in_addr *addr) {
+  static struct in_addr last;
+  static int last_state = -2; /* -2 never looked, -1 none, 0 found */
+  struct in_addr found;
+  int state;
+
+  if(!upstream->gateway) {
+    *addr = upstream->addr;
+    return 0;
+  }
+
+  state = find_default_gateway(&found);
+  if(state != last_state || (state == 0 && found.s_addr != last.s_addr)) {
+    char text[INET_ADDRSTRLEN] = "";
+    if(state == 0) {
+      inet_ntop(AF_INET, &found, text, sizeof(text));
+      log_printf("[nanodns] upstream gateway is now %s\n", text);
+    } else {
+      log_printf("[nanodns] upstream gateway: no default gateway, skipping it\n");
+    }
+    last_state = state;
+    last = found;
+  }
+  if(state != 0) {
+    return -1;
+  }
+  *addr = found;
+  return 0;
+}
+
 static void
 close_upstream_socket(int *fd) {
   if(*fd >= 0) {
@@ -1614,33 +1723,45 @@ forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
                           size_t *response_len, char *via, size_t via_len) {
   int64_t deadline_ms;
 
+  static struct in_addr connected[MAX_UPSTREAMS]; /* where each upstream socket points */
+
   deadline_ms = now_ms() + cfg->timeout_ms;
 
   for(size_t i = 0; i < cfg->upstream_count; ++i) {
+    upstream_t upstream = cfg->upstreams[i];
     struct pollfd pfd;
     int fd;
     int poll_rc;
 
+    if(upstream_current_addr(&cfg->upstreams[i], &upstream.addr) != 0) {
+      continue;
+    }
+    if(upstream_fds[i] >= 0 && upstream.addr.s_addr != connected[i].s_addr) {
+      close_upstream_socket(&upstream_fds[i]); /* the gateway changed: another network */
+    }
+
     fd = upstream_fds[i];
     if(fd < 0) {
-      fd = open_upstream_socket(&cfg->upstreams[i]);
+      fd = open_upstream_socket(&upstream);
       if(fd < 0) {
         continue;
       }
 
       upstream_fds[i] = fd;
+      connected[i] = upstream.addr;
     }
 
     if(drain_upstream_socket(fd) != 0) {
       log_printf("[nanodns] upstream %s drain failed, reconnecting\n",
                  cfg->upstreams[i].text);
       close_upstream_socket(&upstream_fds[i]);
-      fd = open_upstream_socket(&cfg->upstreams[i]);
+      fd = open_upstream_socket(&upstream);
       if(fd < 0) {
         continue;
       }
 
       upstream_fds[i] = fd;
+      connected[i] = upstream.addr;
     }
 
     if(send(fd, request, request_len, 0) < 0) {

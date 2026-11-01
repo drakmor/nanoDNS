@@ -13,6 +13,7 @@ bind6=::1
 
 [upstream]
 # servers are tried in order
+# server=gateway is the network's default gateway (most routers answer DNS there)
 # timeout_ms is the total budget for one query
 server=1.1.1.1
 server=8.8.8.8
