@@ -153,6 +153,7 @@ static const char *k_default_config =
     "# server=<IPv4>\n"
     "# Servers are tried in order until one replies\n"
     "# timeout_ms=<integer-total-budget>\n"
+    "# The budget is split evenly between servers not tried yet\n"
     "#\n"
     "# [overrides]\n"
     "# <dns-mask>=<IPv4>\n"
@@ -1620,6 +1621,27 @@ forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
     struct pollfd pfd;
     int fd;
     int poll_rc;
+    int64_t remaining_ms;
+    int64_t slice_ms;
+    int64_t attempt_deadline_ms;
+
+    remaining_ms = deadline_ms - now_ms();
+    if(remaining_ms <= 0) {
+      log_printf("[nanodns] upstream time budget exhausted, skipping %s and later servers\n",
+                 cfg->upstreams[i].text);
+      break;
+    }
+
+    /*
+     * Split what is left of the budget evenly between this server and the
+     * ones not tried yet, so a server that silently drops packets cannot
+     * consume the whole budget. Time saved by a fast failure (or a fast
+     * reply that had to be discarded) rolls over to the next servers.
+     */
+    slice_ms = remaining_ms / (int64_t)(cfg->upstream_count - i);
+    if(slice_ms < 1) {
+      slice_ms = 1;
+    }
 
     fd = upstream_fds[i];
     if(fd < 0) {
@@ -1653,9 +1675,10 @@ forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
     pfd.fd = fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
+    attempt_deadline_ms = now_ms() + slice_ms;
 
     while(true) {
-      int64_t timeout_ms = deadline_ms - now_ms();
+      int64_t timeout_ms = attempt_deadline_ms - now_ms();
 
       if(timeout_ms <= 0) {
         log_printf("[nanodns] upstream %s timed out\n", cfg->upstreams[i].text);
