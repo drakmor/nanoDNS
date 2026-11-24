@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(PLATFORM_PS4)
@@ -952,15 +953,20 @@ elevate_privileges(void) {
 #endif
 }
 
+/*
+ * Milliseconds from a monotonic clock. Only used for timeouts and retry
+ * scheduling, so it must not follow wall-clock changes (e.g. the console
+ * syncing its time after the payload has started).
+ */
 static int64_t
 now_ms(void) {
-  struct timeval tv;
+  struct timespec ts;
 
-  if(gettimeofday(&tv, NULL) != 0) {
+  if(clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
     return 0;
   }
 
-  return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int
