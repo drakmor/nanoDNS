@@ -15,7 +15,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#if !defined(PLATFORM_HOST)
 #include <sys/sysctl.h>
+#endif
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -27,8 +29,13 @@
 #include <ps5/kernel.h>
 #include <ps5/klog.h>
 #define PAYLOAD_EXEC_NAME "nanodns.elf"
+#elif defined(PLATFORM_HOST)
+/* Native Linux/macOS build used only by the unit tests in tests/. */
+#define PAYLOAD_EXEC_NAME "nanodns-host"
+#define klog_printf(...) ((void)0)
+int kernel_set_ucred_authid(pid_t pid, uint64_t authid);
 #else
-#error "Define PLATFORM_PS4 or PLATFORM_PS5"
+#error "Define PLATFORM_PS4, PLATFORM_PS5 or PLATFORM_HOST"
 #endif
 
 #define APP_NAME "NanoDNS"
