@@ -39,6 +39,19 @@ export PS4_PAYLOAD_SDK=/opt/ps4-payload-sdk
 make -f Makefile.ps4
 ```
 
+## Tests
+
+The config parser, mask matching and DNS packet handling can be unit-tested
+on a regular Linux or macOS machine, without a console or payload SDK:
+
+```sh
+make -C tests
+```
+
+This builds `main.c` natively with `PLATFORM_HOST` under AddressSanitizer
+and UndefinedBehaviorSanitizer and runs the checks in `tests/test_main.c`.
+The same tests run in CI with gcc and clang.
+
 ## Deploy
 
 ```sh
