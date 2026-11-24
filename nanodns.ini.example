@@ -13,7 +13,8 @@ bind6=::1
 
 [upstream]
 # servers are tried in order
-# timeout_ms is the total budget for one query
+# timeout_ms is the total budget for one query,
+# split evenly between the servers not tried yet
 server=1.1.1.1
 server=8.8.8.8
 server=77.88.8.8

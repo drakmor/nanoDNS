@@ -116,7 +116,11 @@ Use `bind6=::` to listen on all local IPv6 interfaces.
 Use `bind6=off` to disable the IPv6 listener entirely.
 
 Entries in `[upstream]` are attempted in order. `timeout_ms` is the total time budget
-for trying the configured upstream servers for a single query.
+for trying the configured upstream servers for a single query. The remaining budget is
+split evenly between the servers that have not been tried yet, so a server that does not
+answer cannot use up the whole budget; time left over by a server that fails fast rolls
+over to the next ones. For example, with three servers and `timeout_ms=1500`, each silent
+server is given about 500 ms before the next one is tried.
 
 Entries in `[exceptions]` are also shell-style masks, one per line. If a query
 matches an exception, it is forwarded to upstream DNS and bypasses all local
