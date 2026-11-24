@@ -9,6 +9,7 @@ Minimal PS4/PS5 payload DNS proxy that:
 - listens on configurable local IPv4 and IPv6 addresses on port `53`
 - applies local IPv4 overrides for domains matching shell-style masks
 - forwards all other DNS queries to upstream resolvers from `/data/nanodns/nanodns.ini`
+- caches upstream answers for their TTL to speed up repeated lookups
 - stores runtime files under `/data/nanodns`
 - writes DNS queries and responses to a log file
 - can additionally mirror logs to `stdout`/`klog` when `debug=1`
@@ -62,6 +63,7 @@ If the file does not exist, it creates one with defaults:
 log=/data/nanodns/nanodns.log
 debug=0
 quiet=0
+cache=1
 bind=127.0.0.1
 bind6=::1
 
@@ -107,6 +109,11 @@ each startup.
 
 `quiet=1` disables popup notifications. The default is `quiet=0`, so startup
 notifications are shown.
+
+`cache=1` (the default) keeps up to 64 upstream answers in memory and serves
+repeated queries from there until their TTL runs out (at most one hour). Negative
+answers (NXDOMAIN / no data) are cached for the SOA minimum TTL. Local overrides
+are never cached, so they always take effect. Use `cache=0` to forward every query.
 
 `bind=` sets the local IPv4 address used by the IPv4 listening socket. The default is `127.0.0.1`.
 Use `bind=0.0.0.0` to listen on all local IPv4 interfaces.

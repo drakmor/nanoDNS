@@ -49,6 +49,9 @@
 #define DEFAULT_TIMEOUT_MS 1500
 #define LISTENER_RETRY_MS 1000
 #define OVERRIDE_TTL 60
+#define DNS_CACHE_ENTRIES 64
+#define DNS_CACHE_MAX_PACKET 1232
+#define DNS_CACHE_MAX_TTL 3600
 #define PRIVILEGED_AUTHID 0x4801000000000013L
 #define KI_PID_OFFSET 72
 #define KI_TDNAME_OFFSET 447
@@ -99,6 +102,7 @@ typedef struct {
   int timeout_ms;
   int debug_enabled;
   int quiet_enabled;
+  int cache_enabled;
   struct in_addr bind_addr;
   char bind_text[INET_ADDRSTRLEN];
   bool bind6_enabled;
@@ -143,6 +147,7 @@ static const char *k_default_config =
     "# log=<path>\n"
     "# debug=0|1\n"
     "# quiet=0|1\n"
+    "# cache=0|1\n"
     "# bind=<IPv4>\n"
     "# bind6=<IPv6>|off\n"
     "# Use 0.0.0.0 to listen on all IPv4 interfaces\n"
@@ -165,6 +170,7 @@ static const char *k_default_config =
     "log=" DEFAULT_LOG_PATH "\n"
     "debug=0\n"
     "quiet=0\n"
+    "cache=1\n"
     "bind=127.0.0.1\n"
     "bind6=::1\n"
     "\n"
@@ -477,6 +483,7 @@ config_set_defaults(app_config_t *cfg) {
   cfg->timeout_ms = DEFAULT_TIMEOUT_MS;
   cfg->debug_enabled = 0;
   cfg->quiet_enabled = 0;
+  cfg->cache_enabled = 1;
   (void)config_set_bind_address(cfg, "127.0.0.1");
   (void)config_set_bind6_address(cfg, "::1");
   snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", DEFAULT_LOG_PATH);
@@ -793,7 +800,8 @@ load_config(const char *path, app_config_t *cfg) {
     if(section == SECTION_GENERAL ||
        (section == SECTION_NONE &&
         (!strcasecmp(key, "log") || !strcasecmp(key, "debug") ||
-         !strcasecmp(key, "quiet") || !strcasecmp(key, "bind") ||
+         !strcasecmp(key, "quiet") || !strcasecmp(key, "cache") ||
+         !strcasecmp(key, "bind") ||
          !strcasecmp(key, "bind6")))) {
       if(!strcasecmp(key, "log")) {
         snprintf(cfg->log_path, sizeof(cfg->log_path), "%s", value);
@@ -818,6 +826,17 @@ load_config(const char *path, app_config_t *cfg) {
                              "[nanodns] warning: %s:%zu invalid quiet value '%s', keeping %s\n",
                              path, line_no, value,
                              cfg->quiet_enabled ? "enabled" : "disabled");
+        }
+      } else if(!strcasecmp(key, "cache")) {
+        int parsed_cache;
+
+        if(parse_int_strict(value, &parsed_cache) == 0) {
+          cfg->cache_enabled = parsed_cache != 0 ? 1 : 0;
+        } else {
+          config_add_warning(cfg,
+                             "[nanodns] warning: %s:%zu invalid cache value '%s', keeping %s\n",
+                             path, line_no, value,
+                             cfg->cache_enabled ? "enabled" : "disabled");
         }
       } else if(!strcasecmp(key, "bind")) {
         if(config_set_bind_address(cfg, value) != 0) {
@@ -1401,6 +1420,299 @@ log_dns_response(const uint8_t *packet, size_t packet_len, const char *via) {
   }
 }
 
+/*
+ * Small answer cache for forwarded queries.
+ *
+ * Entries are keyed by name, type, class and the query bits that change the
+ * upstream answer (RD, CD, EDNS presence and the DO bit). An entry lives for
+ * the smallest TTL in the response (RFC 2308 SOA minimum for negative
+ * answers), capped at DNS_CACHE_MAX_TTL, and TTLs are decremented by the time
+ * spent in the cache when served.
+ */
+#define DNS_CACHE_KEY_EDNS 0x0001
+#define DNS_CACHE_KEY_DO 0x0002
+
+typedef struct {
+  bool used;
+  char qname[MAX_DOMAIN_LEN];
+  uint16_t qtype;
+  uint16_t qclass;
+  uint16_t key_flags;
+  int64_t stored_at_ms;
+  int64_t expires_at_ms;
+  size_t question_end;
+  size_t len;
+  uint8_t packet[DNS_CACHE_MAX_PACKET];
+} dns_cache_entry_t;
+
+static dns_cache_entry_t g_dns_cache[DNS_CACHE_ENTRIES];
+
+/* Parse the resource record at *offset and advance past it. */
+static int
+dns_next_rr(const uint8_t *packet, size_t packet_len, size_t *offset,
+            uint16_t *type, size_t *ttl_offset, uint16_t *rdlength) {
+  char name[MAX_DOMAIN_LEN];
+
+  if(dns_expand_name(packet, packet_len, offset, name, sizeof(name)) != 0) {
+    return -1;
+  }
+
+  if(*offset + 10 > packet_len) {
+    return -1;
+  }
+
+  *type = read_u16(&packet[*offset]);
+  *ttl_offset = *offset + 4;
+  *rdlength = read_u16(&packet[*offset + 8]);
+  *offset += 10;
+
+  if(*offset + *rdlength > packet_len) {
+    return -1;
+  }
+
+  *offset += *rdlength;
+  return 0;
+}
+
+static size_t
+dns_rr_count(const uint8_t *packet) {
+  return (size_t)read_u16(&packet[6]) + read_u16(&packet[8]) +
+         read_u16(&packet[10]);
+}
+
+/*
+ * Cache key bits and maximum UDP response size for a request. Returns -1 if
+ * the request's record sections cannot be parsed.
+ */
+static int
+dns_cache_request_info(const uint8_t *request, size_t request_len,
+                       const dns_question_t *question, uint16_t *key_flags,
+                       size_t *max_udp_size) {
+  size_t offset = question->question_end;
+  size_t count = dns_rr_count(request);
+
+  *key_flags = question->flags & 0x0110; /* RD | CD */
+  *max_udp_size = 512;
+
+  for(size_t i = 0; i < count; ++i) {
+    uint16_t type;
+    uint16_t rdlength;
+    size_t ttl_offset;
+
+    if(dns_next_rr(request, request_len, &offset, &type, &ttl_offset,
+                   &rdlength) != 0) {
+      return -1;
+    }
+
+    if(type == 41) {
+      uint16_t udp_size = read_u16(&request[ttl_offset - 2]);
+
+      *key_flags |= DNS_CACHE_KEY_EDNS;
+      if((request[ttl_offset + 2] & 0x80) != 0) {
+        *key_flags |= DNS_CACHE_KEY_DO;
+      }
+      *max_udp_size = udp_size > 512 ? udp_size : 512;
+    }
+  }
+
+  return 0;
+}
+
+/* How long a response may be cached, in seconds; 0 if not cacheable. */
+static uint32_t
+dns_cache_response_ttl(const uint8_t *response, size_t response_len,
+                       const dns_question_t *question) {
+  dns_question_t rq;
+  uint16_t flags;
+  uint16_t rcode;
+  size_t offset;
+  size_t count;
+  uint32_t min_ttl = DNS_CACHE_MAX_TTL;
+  bool has_rr = false;
+
+  if(response_len > DNS_CACHE_MAX_PACKET ||
+     dns_parse_question(response, response_len, &rq) != 0) {
+    return 0;
+  }
+
+  flags = rq.flags;
+  rcode = flags & 0x000f;
+  if((flags & 0x8000) == 0 || (flags & 0x0200) != 0 || /* QR, TC */
+     (rcode != 0 && rcode != 3) || rq.qdcount != 1 ||
+     rq.qtype != question->qtype || rq.qclass != question->qclass ||
+     strcmp(rq.qname, question->qname) != 0) {
+    return 0;
+  }
+
+  offset = rq.question_end;
+  count = dns_rr_count(response);
+  for(size_t i = 0; i < count; ++i) {
+    uint16_t type;
+    uint16_t rdlength;
+    size_t ttl_offset;
+    uint32_t ttl;
+
+    if(dns_next_rr(response, response_len, &offset, &type, &ttl_offset,
+                   &rdlength) != 0) {
+      return 0;
+    }
+
+    if(type == 41) {
+      continue;
+    }
+
+    ttl = read_u32(&response[ttl_offset]);
+    if(type == 6 && rdlength >= 22) {
+      /* SOA MINIMUM is the last field of the rdata */
+      uint32_t minimum = read_u32(&response[ttl_offset + 6 + rdlength - 4]);
+
+      if(minimum < ttl) {
+        ttl = minimum;
+      }
+    }
+
+    if(ttl < min_ttl) {
+      min_ttl = ttl;
+    }
+    has_rr = true;
+  }
+
+  /* NODATA/NXDOMAIN without an SOA carries no negative TTL: don't cache. */
+  return has_rr ? min_ttl : 0;
+}
+
+static dns_cache_entry_t *
+dns_cache_find(const dns_question_t *question, uint16_t key_flags) {
+  for(size_t i = 0; i < DNS_CACHE_ENTRIES; ++i) {
+    dns_cache_entry_t *entry = &g_dns_cache[i];
+
+    if(entry->used && entry->qtype == question->qtype &&
+       entry->qclass == question->qclass && entry->key_flags == key_flags &&
+       strcmp(entry->qname, question->qname) == 0) {
+      return entry;
+    }
+  }
+
+  return NULL;
+}
+
+static void
+dns_cache_store(const uint8_t *request, size_t request_len,
+                const dns_question_t *question, const uint8_t *response,
+                size_t response_len) {
+  dns_cache_entry_t *entry;
+  uint16_t key_flags;
+  size_t max_udp_size;
+  uint32_t ttl;
+  int64_t current_ms;
+
+  if(question->qdcount != 1 ||
+     dns_cache_request_info(request, request_len, question, &key_flags,
+                            &max_udp_size) != 0) {
+    return;
+  }
+
+  ttl = dns_cache_response_ttl(response, response_len, question);
+  if(ttl == 0) {
+    return;
+  }
+
+  current_ms = now_ms();
+  entry = dns_cache_find(question, key_flags);
+  if(entry == NULL) {
+    /* free or expired slot, otherwise evict the one expiring soonest */
+    entry = &g_dns_cache[0];
+    for(size_t i = 0; i < DNS_CACHE_ENTRIES; ++i) {
+      dns_cache_entry_t *candidate = &g_dns_cache[i];
+
+      if(!candidate->used || candidate->expires_at_ms <= current_ms) {
+        entry = candidate;
+        break;
+      }
+
+      if(candidate->expires_at_ms < entry->expires_at_ms) {
+        entry = candidate;
+      }
+    }
+  }
+
+  entry->used = true;
+  snprintf(entry->qname, sizeof(entry->qname), "%s", question->qname);
+  entry->qtype = question->qtype;
+  entry->qclass = question->qclass;
+  entry->key_flags = key_flags;
+  entry->stored_at_ms = current_ms;
+  entry->expires_at_ms = current_ms + (int64_t)ttl * 1000;
+  entry->question_end = question->question_end;
+  entry->len = response_len;
+  memcpy(entry->packet, response, response_len);
+}
+
+/* Build a response from the cache. Returns 0 on a hit. */
+static int
+dns_cache_lookup(const uint8_t *request, size_t request_len,
+                 const dns_question_t *question, uint8_t *response,
+                 size_t response_cap, size_t *response_len) {
+  dns_cache_entry_t *entry;
+  uint16_t key_flags;
+  size_t max_udp_size;
+  int64_t current_ms;
+  uint32_t elapsed_s;
+  size_t offset;
+  size_t count;
+
+  if(question->qdcount != 1 ||
+     dns_cache_request_info(request, request_len, question, &key_flags,
+                            &max_udp_size) != 0) {
+    return -1;
+  }
+
+  entry = dns_cache_find(question, key_flags);
+  if(entry == NULL) {
+    return -1;
+  }
+
+  current_ms = now_ms();
+  if(current_ms >= entry->expires_at_ms) {
+    entry->used = false;
+    return -1;
+  }
+
+  if(entry->len > response_cap || entry->len > max_udp_size ||
+     entry->question_end != question->question_end) {
+    return -1;
+  }
+
+  memcpy(response, entry->packet, entry->len);
+  /* echo the client's ID and question bytes (keeps its 0x20 name casing) */
+  memcpy(response, request, 2);
+  memcpy(&response[12], &request[12], question->question_end - 12);
+
+  elapsed_s = (uint32_t)((current_ms - entry->stored_at_ms) / 1000);
+  offset = entry->question_end;
+  count = dns_rr_count(response);
+  for(size_t i = 0; i < count; ++i) {
+    uint16_t type;
+    uint16_t rdlength;
+    size_t ttl_offset;
+
+    if(dns_next_rr(response, entry->len, &offset, &type, &ttl_offset,
+                   &rdlength) != 0) {
+      entry->used = false;
+      return -1;
+    }
+
+    if(type != 41) {
+      uint32_t ttl = read_u32(&response[ttl_offset]);
+
+      write_u32(&response[ttl_offset], ttl > elapsed_s ? ttl - elapsed_s : 0);
+    }
+  }
+
+  *response_len = entry->len;
+  return 0;
+}
+
 static int
 open_upstream_socket(const upstream_t *upstream) {
   struct sockaddr_in upstream_addr;
@@ -1797,12 +2109,25 @@ handle_dns_request(const app_config_t *cfg, int server_fd, int *upstream_fds,
     }
   }
 
+  if(cfg->cache_enabled &&
+     dns_cache_lookup(request, request_len, &question, response,
+                      sizeof(response), &response_len) == 0) {
+    send_dns_response_to_client(server_fd, response, response_len,
+                                client_addr, client_len, "cache",
+                                "sendto(client, cache)");
+    return;
+  }
+
   {
     char via[INET_ADDRSTRLEN];
 
     if(forward_query_to_upstream(cfg, request, request_len, question.id,
                                  upstream_fds, response, sizeof(response),
                                  &response_len, via, sizeof(via)) == 0) {
+      if(cfg->cache_enabled) {
+        dns_cache_store(request, request_len, &question, response,
+                        response_len);
+      }
       send_dns_response_to_client(server_fd, response, response_len,
                                   client_addr, client_len, via,
                                   "sendto(client, upstream)");
@@ -1983,6 +2308,12 @@ main(void) {
              cfg.debug_enabled ? "enabled" : "disabled");
   log_printf("[nanodns] quiet mode: %s\n",
              cfg.quiet_enabled ? "enabled" : "disabled");
+  if(cfg.cache_enabled) {
+    log_printf("[nanodns] cache: enabled (%d entries, max ttl %ds)\n",
+               DNS_CACHE_ENTRIES, DNS_CACHE_MAX_TTL);
+  } else {
+    log_printf("[nanodns] cache: disabled\n");
+  }
   log_printf("[nanodns] bind IPv4: %s:%d\n", cfg.bind_text, DNS_PORT);
   if(cfg.bind6_enabled) {
     log_printf("[nanodns] bind IPv6: [%s]:%d\n", cfg.bind6_text, DNS_PORT);
