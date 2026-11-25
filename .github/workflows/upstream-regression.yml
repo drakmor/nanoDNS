@@ -1,0 +1,19 @@
+name: Upstream forwarding regression
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check upstream forwarding with ASan and UBSan
+        env:
+          CC: ${{ matrix.cc }}
+        run: python3 tests/upstream-regression.py
