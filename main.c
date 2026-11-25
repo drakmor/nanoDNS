@@ -1699,9 +1699,16 @@ forward_query_to_upstream(const app_config_t *cfg, const uint8_t *request,
                      cfg->upstreams[i].text, read_u16(response));
           close_upstream_socket(&upstream_fds[i]);
           break;
+        } else if((read_u16(&response[2]) & 0x8000) == 0) {
+          log_printf("[nanodns] upstream %s returned a query instead of a response\n",
+                     cfg->upstreams[i].text);
+          close_upstream_socket(&upstream_fds[i]);
+          break;
         } else {
           *response_len = (size_t)nread;
           snprintf(via, via_len, "%s", cfg->upstreams[i].text);
+          /* Do not carry a connected UDP socket into the next query. */
+          close_upstream_socket(&upstream_fds[i]);
           return 0;
         }
       } else if((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
